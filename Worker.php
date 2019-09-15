@@ -30,6 +30,14 @@ class Worker
     //worker启动时的回调方法
     public $onWorkerStart = null;
 
+    public static $status = 0;
+
+    //运行中
+    const STATUS_RUNNING = 1;
+    //停止
+    const STATUS_SHUTDOWN = 2;
+
+
     public function __construct(){
         static::$instance = $this;
     }
@@ -46,7 +54,11 @@ class Worker
         //非调试模式，不是守护进程模式启动的时候，把标准输出重定向
         static::resetStd();
 
-        static::forkWorker();//fork 子进程
+        //fork 子进程
+        static::forkWorkers();
+
+        //master监控worker
+        static::monitorWorkers();
     }
 
     public static function checkEnv()
@@ -119,13 +131,15 @@ class Worker
 
         $master_alive = $master_id && posix_kill($master_id,0);
 
-        if ($master_alive) {
-            if ($command1 == 'start' && posix_getpid() != $master_id) {
-                exit('请不要重复启动谢谢!'.PHP_EOL);
-            } else {
-                if ($command1 !== 'start') {
-                    exit('进程还没有启动呢!');
-                }
+        if($master_alive){
+            //不能重复启动
+            if($command1 == 'start' && posix_getpid() != $master_id){
+                exit('worker is already running !'.PHP_EOL);
+            }
+        }else{
+            //项目未启动的情况下，只有start命令有效
+            if ($command1 != 'start') {
+                exit('worker not run!' . PHP_EOL);
             }
         }
 
@@ -143,12 +157,28 @@ class Worker
                 break;
 
             case 'stop':
-                echo '请补全stop进程部分的逻辑!';
+                //SIGINT信号被自定义在signalHandler 里，会以 exit(0) 的方式退出
+                $master_id && posix_kill($master_id, SIGINT);
+
+                echo "准备杀死PID是{$master_id}的master进程" . PHP_EOL;
+
+                //如果没有杀死，
+                while ($master_id && posix_kill($master_id, 0)) {
+                    usleep(300000);
+                }
                 exit(0);
                 break;
 
             case 'status':
-                echo '进程状态不可以查看，因为你还没有写查看进程状态的代码!';
+                if(is_file(static::$status_file)){
+                    //先删除就得status文件
+                    @unlink(static::$status_file);
+                }
+                //给master发送信号
+                posix_kill($master_id,SIGUSR2);
+                //等待worker进程往status文件里写入状态
+                usleep(300000);
+                @readfile(static::$status_file);
                 exit(0);
                 break;
 
@@ -175,7 +205,7 @@ class Worker
             if ( -1 === posix_setsid()) {
                 throw new Exception('SET SID FAIL');
             }
-            static::setProcessTitle('halwegworker:master');
+            static::setProcessTitle('halweg_worker:master');
 
         } else {
             throw new Exception('fork fail!');
@@ -208,10 +238,12 @@ class Worker
     {
         switch ($signal) {
             case SIGUSR2:
-                //
+                //show status
+                static::writeStatus();
                 break;
             case SIGINT:
-                //
+                //关闭 master和worker
+                static::stopAll();
                 break;
             case SIGPIPE:
                 //
@@ -241,8 +273,117 @@ class Worker
     public static function forkWorkers()
     {
         $worker_count = static::$instance->count;
-        var_dump($worker_count);
-        exit();
+
+        while (count(static::$workers) < $worker_count) {
+            static::forkOneWorker(static::$instance);
+        }
+
+    }
+
+    public static function forkOneWorker($instance)
+    {
+        $pid = pcntl_fork();
+
+        if ($pid > 0) {
+            static::$workers[$pid] = $pid;
+        } elseif ($pid == 0) {
+            $worker_pid = posix_getpid();
+            static::log("创建了一个pid是 {$worker_pid} 的worker进程");
+            static::setProcessTitle('halweg_worker process');
+
+            $instance->run();
+        } else {
+            throw new Exception('fork on worker fail');
+        }
+    }
+
+    public function run()
+    {
+        if ($this->onWorkerStart) {
+
+            try {
+                call_user_func($this->onWorkerStart, $this);
+            } catch (\Exception $e) {
+                static::log($e);
+                sleep(1);
+                exit(250);
+            } catch (\Error $e) {
+                static::log($e);
+                sleep(1);
+                exit(250);
+            }
+
+        }
+
+        while (1) {
+            pcntl_signal_dispatch();
+            sleep(1);
+        }
+    }
+
+    public static function monitorWorkers()
+    {
+        static::$status = self::STATUS_RUNNING;
+
+        while (1) {
+            pcntl_signal_dispatch();
+            $status = 0;
+
+            //阻塞（休眠）在这里，直到 子进程退出，
+            $pid = pcntl_wait($status, WUNTRACED);
+
+            //阻塞期间如果有未处理的信号，所以要再dispatch一遍
+            pcntl_signal_dispatch();
+
+            if ($pid > 0) {
+                //意外退出时才重新fork，如果是我们想让worker退出，status = STATUS_SHUTDOWN
+                if (static::$status != static::STATUS_SHUTDOWN) {
+                    unset(static::$workers[$pid]);
+                    static::forkOneWorker(static::$instance);
+                }
+            }
+        }
+    }
+
+    public static function stopAll()
+    {
+        $pid = posix_getpid();
+
+        if ($pid === self::$master_pid) {
+            static::$status = self::STATUS_SHUTDOWN;
+            foreach (self::$workers as $worker_pid) {
+                posix_kill($worker_pid, SIGINT);
+            }
+
+            @unlink(self::$pid_file);
+            exit(0);
+        } else{ //worker进程
+            static::log('worker[' . $pid .'] stop');
+            exit(0);
+        }
+
+    }
+
+    public static function writeStatus()
+    {
+        $pid = posix_getpid();
+
+        if($pid == static::$master_pid){ //master进程
+
+            $master_alive = static::$master_pid && posix_kill(static::$master_pid,0);
+            $master_alive = $master_alive ? 'is running' : 'die';
+            $result = file_put_contents(static::$status_file, 'master[' . static::$master_pid . '] ' . $master_alive . PHP_EOL, FILE_APPEND | LOCK_EX);
+            //给worker进程发信号
+            foreach(static::$workers as $pid){
+                posix_kill($pid,SIGUSR2);
+            }
+        }else{ //worker进程
+
+            $name = 'worker[' . $pid . ']';
+            $alive = $pid && posix_kill($pid, 0);
+            $alive = $alive ? 'is running' : 'die';
+            file_put_contents(static::$status_file, $name . ' ' . $alive . PHP_EOL, FILE_APPEND | LOCK_EX);
+        }
     }
 
 }
